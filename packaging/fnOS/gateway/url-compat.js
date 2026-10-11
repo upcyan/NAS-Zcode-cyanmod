@@ -95,8 +95,10 @@
     };
   }
 
-  // ── WebSocket / EventSource / Worker ─────────────────────────────────────
-  ["WebSocket", "EventSource", "Worker", "SharedWorker"].forEach(function (name) {
+  // ── EventSource / Worker / SharedWorker ──────────────────────────────────
+  // WebSocket 单独在下方处理（它还要挂断线自愈）。这里不要把它一起包，
+  // 否则会被双重 Proxy 包装。
+  ["EventSource", "Worker", "SharedWorker"].forEach(function (name) {
     var Native = globalThis[name];
     if (typeof Native !== "function") return;
     globalThis[name] = new Proxy(Native, {
@@ -108,6 +110,101 @@
       },
     });
   });
+
+  // ── 断线自愈 ─────────────────────────────────────────────────────────────
+  // ZCode 前端自带的「重连」只由服务端 agent 生命周期事件驱动
+  // （onAgentRuntimeLifecycle / onAgentRuntimeRestarted）。网关重启、面板重载、
+  // 网络抖动这类**纯连接断开**不会触发它 —— 前端只是把 close 抛给上层。
+  // 表现就是：页面看着一切正常，但发送消息、上传附件全部无声卡住（一直转圈）。
+  //
+  // 这里在传输层兜底：只处理「已经建立过、然后意外断开」的连接（wasOpen 为真），
+  // 等一小会儿探测服务是否已恢复；恢复则重载页面，未恢复则持续重试并提示。
+  //
+  // 为什么是重载而不是就地重连：服务端按连接维护订阅，换一条连接等于订阅全丢，
+  // 就地重连只会变成「看着连上了、其实收不到任何推送」，比重载更隐蔽也更糟。
+  // 应用主动 close（dispose/logout）不触发自愈。
+  (function () {
+    var RECOVER_DELAY_MS = 3000;
+    var MAX_WAIT_MS = 5 * 60 * 1000;
+
+    var recovering = false;
+    var startedAt = 0;
+
+    function banner(text) {
+      var id = "__zcode_gw_recover__";
+      var el = document.getElementById(id);
+      if (!el) {
+        el = document.createElement("div");
+        el.id = id;
+        el.style.cssText =
+          "position:fixed;left:50%;top:12px;transform:translateX(-50%);z-index:2147483647;" +
+          "padding:8px 16px;border-radius:8px;font:13px/1.5 system-ui,sans-serif;" +
+          "background:#3b3b3b;color:#eee;box-shadow:0 4px 16px rgba(0,0,0,.35);pointer-events:none";
+        (document.body || document.documentElement).appendChild(el);
+      }
+      el.textContent = text;
+    }
+
+    /** 服务是否已恢复；no-store 避免命中缓存得出假阳性 */
+    function probe() {
+      return fetch(PREFIX + "/", { method: "GET", cache: "no-store" })
+        .then(function (res) { return res.ok; })
+        .catch(function () { return false; });
+    }
+
+    function waitAndReload() {
+      if (Date.now() - startedAt > MAX_WAIT_MS) {
+        banner("与服务断开，请手动刷新页面");
+        return;
+      }
+      probe().then(function (ok) {
+        if (ok) {
+          banner("连接已恢复，正在刷新…");
+          setTimeout(function () { location.reload(); }, 300);
+          return;
+        }
+        banner("与服务断开，正在重试…");
+        setTimeout(waitAndReload, RECOVER_DELAY_MS);
+      });
+    }
+
+    function recover() {
+      if (recovering) return;
+      recovering = true;
+      startedAt = Date.now();
+      banner("与服务断开，正在恢复…");
+      setTimeout(waitAndReload, RECOVER_DELAY_MS);
+    }
+
+    var NativeWS = globalThis.WebSocket;
+    if (typeof NativeWS === "function") {
+      globalThis.WebSocket = new Proxy(NativeWS, {
+        construct: function (target, args, newTarget) {
+          try {
+            if (args.length) args[0] = route(args[0] instanceof URL ? args[0].href : args[0]);
+          } catch (e) {}
+          var ws = Reflect.construct(target, args, newTarget);
+          try {
+            var appClosed = false;
+            var wasOpen = false;
+            var nativeClose = ws.close;
+            Object.defineProperty(ws, "close", {
+              configurable: true,
+              writable: true,
+              value: function () {
+                appClosed = true;
+                return nativeClose.apply(ws, arguments);
+              },
+            });
+            ws.addEventListener("open", function () { wasOpen = true; });
+            ws.addEventListener("close", function () { if (!appClosed && wasOpen) recover(); });
+            ws.addEventListener("error", function () { if (!appClosed && wasOpen) recover(); });
+          } catch (e) {}
+          return ws;
+        },
+      });
+    }
+  })();
 
   // ── 动态插入的资源元素 ───────────────────────────────────────────────────
   // Vite 的 modulepreload helper 走 `link.href = "/" + path`，绕开 fetch/XHR，
